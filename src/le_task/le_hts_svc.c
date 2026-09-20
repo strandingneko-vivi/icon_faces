@@ -16,7 +16,7 @@ struct temp_measurement {
 	uint8_t temp[4];
 } __packed;
 
-static volatile bool ht_notify_enabled = false;
+static atomic_t ht_notify_enabled = ATOMIC_INIT(false);
 static struct temp_measurement measurement = {
 	.flags = 0x00, /* Celsius, no timestamp, no type */
 };
@@ -47,7 +47,7 @@ static ssize_t read_temp_type(struct bt_conn *conn, const struct bt_gatt_attr *a
 
 static void measurement_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
-	ht_notify_enabled = (value == BT_GATT_CCC_NOTIFY);
+	atomic_set(&ht_notify_enabled, (value == BT_GATT_CCC_NOTIFY));
 }
 
 /* Health Thermometer Service */
@@ -60,39 +60,60 @@ BT_GATT_SERVICE_DEFINE(
 	BT_GATT_CHARACTERISTIC(BT_UUID_HTS_TEMP_TYP, BT_GATT_CHRC_READ, BT_GATT_PERM_READ_ENCRYPT,
 			       read_temp_type, NULL, NULL), );
 
-/* SHT3X sensor thread */
-#define SHT3X_THREAD_SIZE 1024
-#define SHT3X_THREAD_PRIO 7
+/* Temperature sensor thread */
+#define TEMP_THREAD_SIZE 1024
+#define TEMP_THREAD_PRIO 7
 
 static const struct device *sht3x = DEVICE_DT_GET(DT_NODELABEL(sht3xd));
+static const struct device *nrf_temp = DEVICE_DT_GET(DT_NODELABEL(temp));
+
 static struct sensor_value temp, hum;
 
-static void sht3x_thread(void *p1, void *p2, void *p3)
+enum {
+	TEMP_SHT3X = 0,
+	TEMP_NRF = 1,
+};
+
+static void temp_thread(void *p1, void *p2, void *p3)
 {
-	if (!device_is_ready(sht3x)) {
-		LOG_ERR("SHT3X device not ready");
+	const struct device *sensor_dev;
+	int sensor;
+
+	if (device_is_ready(sht3x)) {
+		sensor = TEMP_SHT3X;
+		LOG_DBG("use TEMP: SHT3X");
+	} else if (device_is_ready(nrf_temp)) {
+		sensor = TEMP_NRF;
+		LOG_DBG("use TEMP: NRF_TEMP");
+	} else {
+		LOG_ERR("no temp sensor ready (SHT3X / NRF_TEMP)");
 		return;
 	}
+	sensor_dev = (sensor == TEMP_SHT3X) ? sht3x : nrf_temp;
 
 	while (1) {
-		if (sensor_sample_fetch(sht3x) == 0) {
-			sensor_channel_get(sht3x, SENSOR_CHAN_AMBIENT_TEMP, &temp);
-			sensor_channel_get(sht3x, SENSOR_CHAN_HUMIDITY, &hum);
+		if (sensor_sample_fetch(sensor_dev) == 0) {
+			if (sensor == TEMP_SHT3X) {
+				sensor_channel_get(sensor_dev, SENSOR_CHAN_AMBIENT_TEMP, &temp);
+				sensor_channel_get(sensor_dev, SENSOR_CHAN_HUMIDITY, &hum);
+			} else {
+				sensor_channel_get(sensor_dev, SENSOR_CHAN_DIE_TEMP, &temp);
+			}
 			encode_temp(&temp);
 
 			// LOG_INF("Temp: %d.%06d degC, Humidity: %d.%06d %%", temp.val1, temp.val2,
 			// 	hum.val1, hum.val2);
 
-			if (ht_notify_enabled) {
+			if (atomic_get(&ht_notify_enabled)) {
 				bt_gatt_notify_uuid(NULL, BT_UUID_HTS_MEASUREMENT, le_hts_svc.attrs, &measurement, sizeof(measurement));
 			}
 		} else {
-			LOG_ERR("SHT3X sample fetch failed");
+			LOG_ERR("sample fetch failed: %s", sensor == TEMP_SHT3X ? "SHT3X" : "NRF_TEMP");
 		}
 
 		k_sleep(K_MSEC(1000));
 	}
 }
 
-K_THREAD_DEFINE(sht3x_tid, SHT3X_THREAD_SIZE, sht3x_thread, NULL, NULL, NULL,
-		K_PRIO_PREEMPT(SHT3X_THREAD_PRIO), 0, 0);
+K_THREAD_DEFINE(temp_tid, TEMP_THREAD_SIZE, temp_thread, NULL, NULL, NULL,
+		K_PRIO_PREEMPT(TEMP_THREAD_PRIO), 0, 0);
